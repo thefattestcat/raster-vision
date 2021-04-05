@@ -6,6 +6,8 @@ import random
 import os
 from abc import abstractmethod
 
+import pandas as pd
+
 from rastervision.pipeline.file_system import list_paths
 from rastervision.core.rv_pipeline import *
 from rastervision.core.backend import *
@@ -13,92 +15,10 @@ from rastervision.core.data import *
 from rastervision.pytorch_backend import *
 from rastervision.pytorch_learner import *
 
-from rastervision.core.data.raster_transformer.min_max_transformer_config import MinMaxRasterTransformerConfig
 
-BUILDINGS = 'buildings'
-ROADS = 'roads'
-
-
-class SpacenetConfig(object):
-    def __init__(self, raw_uri):
-        self.raw_uri = raw_uri
-
-    @staticmethod
-    def create(raw_uri, target):
-        if target.lower() == BUILDINGS:
-            return VegasBuildings(raw_uri)
-        elif target.lower() == ROADS:
-            return VegasRoads(raw_uri)
-        else:
-            raise ValueError('{} is not a valid target.'.format(target))
-
-    def get_raster_source_uri(self, id):
-        return os.path.join(self.raw_uri, self.base_dir, self.raster_dir,
-                            '{}{}.tif'.format(self.raster_fn_prefix, id))
-
-    def get_geojson_uri(self, id):
-        return os.path.join(self.raw_uri, self.base_dir, self.label_dir,
-                            '{}{}.geojson'.format(self.label_fn_prefix, id))
-
-    def get_scene_ids(self):
-        label_dir = os.path.join(self.raw_uri, self.base_dir, self.label_dir)
-        label_paths = list_paths(label_dir, ext='.geojson')
-        label_re = re.compile(r'.*{}(\d+)\.geojson'.format(
-            self.label_fn_prefix))
-        scene_ids = [
-            label_re.match(label_path).group(1) for label_path in label_paths
-        ]
-        return scene_ids
-
-    @abstractmethod
-    def get_class_config(self):
-        pass
-
-    @abstractmethod
-    def get_class_id_to_filter(self):
-        pass
-
-
-class VegasRoads(SpacenetConfig):
-    def __init__(self, raw_uri):
-        self.base_dir = 'spacenet/SN3_roads/train/AOI_2_Vegas/'
-        self.raster_dir = 'PS-RGB/'
-        self.label_dir = 'geojson_roads/'
-        self.raster_fn_prefix = 'SN3_roads_train_AOI_2_Vegas_PS-RGB_img'
-        self.label_fn_prefix = 'SN3_roads_train_AOI_2_Vegas_geojson_roads_img'
-        super().__init__(raw_uri)
-
-    def get_class_config(self):
-        return ClassConfig(
-            names=['road', 'background'], colors=['orange', 'black'])
-
-    def get_class_id_to_filter(self):
-        return {0: ['has', 'highway']}
-
-
-class VegasBuildings(SpacenetConfig):
-    def __init__(self, raw_uri):
-        self.base_dir = 'spacenet/SN2_buildings/train/AOI_2_Vegas'
-        self.raster_dir = 'PS-RGB'
-        self.label_dir = 'geojson_buildings'
-        self.raster_fn_prefix = 'SN2_buildings_train_AOI_2_Vegas_PS-RGB_img'
-        self.label_fn_prefix = 'SN2_buildings_train_AOI_2_Vegas_geojson_buildings_img'
-        super().__init__(raw_uri)
-
-    def get_class_config(self):
-        return ClassConfig(
-            names=['building', 'background'], colors=['orange', 'black'])
-
-    def get_class_id_to_filter(self):
-        return {0: ['has', 'building']}
-
-
-def build_scene(spacenet_cfg: SpacenetConfig,
+def build_scene(image_uri, label_uri,
                 id: str,
                 channel_order: Optional[list] = None) -> SceneConfig:
-    image_uri = spacenet_cfg.get_raster_source_uri(id)
-    label_uri = spacenet_cfg.get_geojson_uri(id)
-
     raster_source = RasterioSourceConfig(
         uris=[image_uri], channel_order=channel_order,
         transformers=[MinMaxRasterTransformerConfig()])
@@ -126,89 +46,45 @@ def build_scene(spacenet_cfg: SpacenetConfig,
 
 def get_config(runner,
                raw_uri: str,
+               spacenet_csv_uri: str,
                root_uri: str,
-               target: str = BUILDINGS,
-               nochip: bool = True,
+               test_aoi: str = 'all',
+               train_sz: float = 1.0,
                test: bool = False) -> SemanticSegmentationConfig:
-    """Generate the pipeline config for this task. This function will be called
-    by RV, with arguments from the command line, when this example is run.
-
-    Args:
-        runner (Runner): Runner for the pipeline. Will be provided by RV.
-        raw_uri (str): Directory where the raw data resides
-        root_uri (str): Directory where all the output will be written.
-        target (str): "buildings" | "roads". Defaults to "buildings".
-        nochip (bool, optional): If True, read directly from the TIFF during
-            training instead of from pre-generated chips. The analyze and chip
-            commands should not be run, if this is set to True. Defaults to
-            True.
-        test (bool, optional): If True, does the following simplifications:
-            (1) Uses only a small subset of training and validation scenes.
-            (2) Enables test mode in the learner, which makes it use the
-                test_batch_sz and test_num_epochs, among other things.
-            Defaults to False.
-
-    Returns:
-        SemanticSegmentationConfig: An pipeline config.
-    """
-
-    spacenet_cfg = SpacenetConfig.create(raw_uri, target)
-    scene_ids = spacenet_cfg.get_scene_ids()
-    if len(scene_ids) == 0:
-        raise ValueError(
-            'No scenes found. Something is configured incorrectly.')
-
-    random.seed(5678)
-    scene_ids = sorted(scene_ids)
-    random.shuffle(scene_ids)
-
-    # Workaround to handle scene 1000 missing on S3.
-    if '1000' in scene_ids:
-        scene_ids.remove('1000')
-
-    split_ratio = 0.8
-    num_train_ids = round(len(scene_ids) * split_ratio)
-    train_ids = scene_ids[:num_train_ids]
-    val_ids = scene_ids[num_train_ids:]
-
-    if test:
-        train_ids = train_ids[:4]
-        val_ids = val_ids[:1]
-
     channel_order = [0, 1, 2]
+    class_config = ClassConfig(
+        names=['building', 'background'], colors=['orange', 'black'])
+    train_sz = float(train_sz)
 
-    class_config = spacenet_cfg.get_class_config()
-    train_scenes = [
-        build_scene(spacenet_cfg, id, channel_order) for id in train_ids
-    ]
-    val_scenes = [
-        build_scene(spacenet_cfg, id, channel_order) for id in val_ids
-    ]
+    df = pd.read_csv(spacenet_csv_uri)
+    train_scenes = []
+    val_scenes = []
+    if test:
+        df = df.subset(5)
+        df['splits'] = ['train'] * 4 + ['val']
+
+    for _, row in df.iterrows():
+        scene_id = row['scene_id']
+        image_uri = row['image_uri']
+        label_uri = row['label_uri']
+        scene = build_scene(image_uri, label_uri, scene_id, channel_order)
+        if row['split'] == 'train':
+            train_scenes.append(scene)
+        else:
+            val_scenes.append(scene)
+
     scene_dataset = DatasetConfig(
         class_config=class_config,
         train_scenes=train_scenes,
         validation_scenes=val_scenes)
 
-    chip_sz = 325
+    chip_sz = 217
     img_sz = chip_sz
 
     chip_options = SemanticSegmentationChipOptions(
         window_method=SemanticSegmentationWindowMethod.sliding, stride=chip_sz)
-
-    if nochip:
-        data = SemanticSegmentationGeoDataConfig(
-            scene_dataset=scene_dataset,
-            window_opts=GeoDataWindowConfig(
-                method=GeoDataWindowMethod.sliding,
-                size=chip_sz,
-                stride=chip_options.stride),
-            img_sz=img_sz,
-            num_workers=4)
-    else:
-        data = SemanticSegmentationImageDataConfig(
-            img_sz=img_sz, num_workers=4)
-            # img_format='png', label_format='png')
-
+    data = SemanticSegmentationImageDataConfig(
+        img_sz=img_sz, num_workers=4, group_train_sz_rel=train_sz)
     backend = PyTorchSemanticSegmentationConfig(
         data=data,
         model=SemanticSegmentationModelConfig(backbone=Backbone.resnet50),
@@ -218,7 +94,7 @@ def get_config(runner,
             test_num_epochs=2,
             batch_sz=8,
             one_cycle=True),
-        log_tensorboard=True,
+        log_tensorboard=False,
         run_tensorboard=False,
         test_mode=test)
 
